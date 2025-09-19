@@ -1,0 +1,656 @@
+---
+title: "Drp1 isoform analysis with UMI-deduplication"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: true
+    code-overflow: wrap
+execute: 
+  cache: true
+  warning: false
+  error: false
+---
+
+## Preprossing pipeline
+
+### Base calling and demultiplexing
+
+I run `dorado/0.7.0` basecalling (enable barcoding detection with `--kit-name` will automatic trim primer and barcode, so `--no-trim` has no effect).
+
+```         
+dorado basecaller sup $pod5 --kit-name SQK-NBD114-24 --no-trim > ${dir}/basecalled_reads.bam
+dorado summary ${dir}/basecalled_reads.bam >  ${dir}/basecalled_summary.txt
+```
+
+Demux into separate files and then fastq files.
+
+```         
+dorado demux --threads 16 --output-dir ${dir}/demux --no-classify  ${dir}/basecalled_reads.bam
+```
+
+### Run Flexiplex to remove barcode and UMI
+* 1, First step to get UMI and attach to the beginning of read. 
+* 2, Second step to remove barcode.
+* 3, Then need to move UMI to the end of read.
+* Flexiplex is able to get UMI in ~80-90% reads. 
+
+```
+zcat ${raw_reads} | \
+flexiplex -x $TSO_REV_CMP -u $UMI_REV_CMP -x $UMI_LEFT_FLANK_REV_CMP \
+  -b "" -k "?" \
+  -f 2 -e 1 -p 8 -n "UMI_extraction" | \
+flexiplex -x $BC_LEFT_FLANK_FWD -b $BC_SEQ -x $BC_RIGHT_FLANK_FWD -k "?" -f 1 -p 8 -n "BC_extraction"  | \
+sed 's/\(\?_#?\)\(_[^#]*\)\(#.*\)/\1\3\2/' > ${base}_fp.fastq
+```
+
+### Run UMI-tools to deduplicate UMI
+
+* Map to mouse NCBI (GRCm39) or human (GRCh38) genome using the code below.
+* Then UMI-tools to remove duplicates based on UMI and coordinate (only look at the chromosome with DNM1L).
+
+```
+paftools.js gff2bed $gtf > ${name}_anno.bed
+minimap2 -ax splice -I 1000G -t $num_cores --junc-bed ${name}_anno.bed $genome $raw_reads | samtools sort -@ $num_cores -O BAM -o ${name}_sorted.bam
+samtools index -@ $num_cores ${name}_sorted.bam
+umi_tools dedup -I ${name}_sorted.bam --chrom=${chr} --output-stats=${name} --edit-distance-threshold=2 --method=directional -S ${name}_dedup.bam
+
+```
+
+### Merge bam files and then run Bambu
+
+Run Bambu with gencode annotation (NCBI Refseq GCA_000001405.15 for human and GCF_000001635.27 for mouse) with NDR=0.2 (relative strigent detection of novel isoform).
+
+```         
+samtools merge -o Drp1_human_dge/merged/${name}_sorted_dedup_merged.bam ${run1} ${run2}
+samtools merge -o Drp1_mouse_dge/merged/${name}_sorted_dedup_merged.bam ${run1} ${run2}
+
+Rscript --vanilla bambu_analysis.R Drp1_human_dge/merged
+Rscript --vanilla bambu_analysis.R Drp1_mouse_dge/merged
+```
+
+## Visualization of prelimary results 
+
+```{r, warning=FALSE, message=FALSE}
+
+library(ggfortify)
+library(tidyverse)
+library(bambu)
+library(pheatmap)
+library(DT)
+library(ggh4x)
+library(cowplot)
+library(ComplexHeatmap)
+library(RColorBrewer)
+```
+
+
+### Mouse data, initial QC stats
+```{r}
+se1 <- readRDS("Drp1_mouse_dge/merged/default/se1.rds")[, -c(9:10)]
+group <- factor(rep(c('Brain','Lung','Spleen','Heart',#'Liver',
+                      'Kidney','Muscle'), each = 2))
+```
+
+```{r, fig.height=5, fig.width=12, dev=c('png', 'pdf')}
+#| fig-cap: "Fig1 Sequencing stats of each sample"
+library.size <- colSums(assays(se1)$counts)
+gene.count <- colSums(assays(se1)$count[rowData(se1)$GENEID == 'Dnm1l',])
+capture.rate <- gene.count/library.size
+# hist(capture.rate, main = 'capture rate in chr16')
+
+anno.col <- data.frame(capture.rate = capture.rate,
+                       count_DNM1L = gene.count,
+                       count_chr16 = library.size,
+                       group = group)
+write.csv(anno.col, 'mouse_stats.csv')
+
+anno.col %>% 
+  pivot_longer(1:3) %>% 
+  ggplot(aes(x = group, y = value, col = group)) +
+  geom_point() +
+  facet_wrap(.~name, scales = 'free_y') +
+  scale_color_brewer(palette = "Set2") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+p1 <- anno.col %>% select(capture.rate, group) %>%
+  ggplot(aes(x = group, y = capture.rate, col = group)) +
+  geom_point(size = 4) +
+  scale_color_brewer(palette = "Set2") +
+    labs(
+    title = "Capture Rate in Chr12",
+    x = "Group",
+    y = "Proportion",
+    color = "Group" # Clear legend title
+  ) + 
+  scale_y_continuous(limits = c(0, NA)) +
+  geom_hline(yintercept = 1, linetype = 'dashed', col = 'grey70') +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        legend.position = "bottom")
+
+p2 <- anno.col %>% select(count_DNM1L, group) %>%
+  ggplot(aes(x = group, y = count_DNM1L/1e3, col = group)) +
+  geom_point(size = 4) +
+  scale_color_brewer(palette = "Set2") +
+    labs(
+    title = "DNM1L Counts",
+    x = "Group",
+    y = "Counts (*1000)",
+    color = "Group" # Clear legend title
+  ) + 
+  scale_y_continuous(limits = c(0, NA)) +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        legend.position = "bottom")
+
+p3 <- anno.col %>% select(count_chr16, group) %>%
+  ggplot(aes(x = group, y = count_chr16/1e3, col = group)) +
+  geom_point(size = 4) +
+  scale_color_brewer(palette = "Set2") +
+    labs(
+    title = "Chr12 Total Counts",
+    x = "Group",
+    y = "Counts (*1000)",
+    color = "Group" # Clear legend title
+  ) +
+  scale_y_continuous(limits = c(0, NA)) +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        legend.position = "bottom")
+
+p <- plot_grid(p1,p2,p3, nrow = 1)
+print(p)
+ggsave('eda_plot/qc.pdf', width = 12, height = 5)
+```
+
+### PCA plots using log2CPM
+```{r, dev=c('png', 'pdf')}
+#| fig-cap: "Fig2A PCA plot using log2CPM of all transcripts of chr16"
+#| layout-ncol: 2
+
+exp <- log2(assays(se1)$CPM + 1) 
+exp <- exp[rowSums(exp)!=0, ] # filter for non expressed and liver
+
+# group <- group[-c(9:10), drop=T]
+
+colnames(exp) <- paste(group, c('S1','S2'), sep = '_')  # rename by replicate (S) 
+
+# anno.col <- anno.col[-c(9:10),]
+
+autoplot(prcomp(exp %>% t()), 
+         data = anno.col,
+         color = 'group', size = 'capture.rate') +
+  scale_color_brewer(palette = "Set2") +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+
+autoplot(prcomp(exp %>% t()), 
+         data = anno.col,
+         color = 'group', size = 'count_chr16') +
+  scale_color_brewer(palette = "Set2") +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+
+autoplot(prcomp(exp %>% t()), 
+         data = anno.col,
+         color = 'group', size = 'count_DNM1L') +
+  scale_color_brewer(palette = "Set2") +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+
+autoplot(prcomp(exp %>% t()), 
+         data = anno.col,
+         color = 'group', size = 4) +
+  scale_color_brewer(palette = "Set2") +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+```
+
+```{r, dev=c('png', 'pdf')}
+#| fig-cap: "Fig2B PCA plot using only log2CPM of DNM1L"
+#| layout-ncol: 2
+
+exp <- log2(assays(se1)$CPM[rowData(se1)$GENEID == 'Dnm1l',] + 1) 
+exp <- exp[rowSums(exp)!=0, ] # filter for non expressed and liver
+
+colnames(exp) <- paste(group, c('S1','S2'), sep = '_') # rename by replicate (S) 
+
+autoplot(prcomp(exp %>% t()), 
+         data = anno.col,
+         color = 'group', size = 'capture.rate') +
+  scale_color_brewer(palette = "Set2") +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+
+autoplot(prcomp(exp %>% t()), 
+         data = anno.col,
+         color = 'group', size = 'count_chr16') +
+  scale_color_brewer(palette = "Set2") +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+
+autoplot(prcomp(exp %>% t()), 
+         data = anno.col,
+         color = 'group', size = 'count_DNM1L') +
+  scale_color_brewer(palette = "Set2") +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+
+autoplot(prcomp(exp %>% t()), 
+         data = anno.col,
+         color = 'group', size = 4) +
+  scale_color_brewer(palette = "Set2") +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+
+```
+### Heatmap using log2CPM
+```{r, fig.height=15, dev=c('png', 'pdf')}
+#| fig-cap: "Fig3 Bambu output showing the structure and expression of isoforms"
+plotBambu(se1, type = "annotation", gene_id = "Dnm1l")
+```
+
+```{r, fig.height=15, dev=c('png', 'pdf')}
+#| fig-cap: "Fig4 Heatmap showing isoform expression, clustered by default"
+
+# anno.col <- data.frame(capture.rate = capture.rate,
+#                        group = group,
+#                        library.size = colSums(assays(se1)$counts))
+rownames(anno.col) <- colnames(exp)
+
+ann_colors <- list(group = setNames(brewer.pal(6, "Set2"), levels(group)),
+                   capture.rate = brewer.pal(n = 9, name = "BuPu"),
+                   count_DNM1L = brewer.pal(n = 9, name = "BuGn"))
+
+exp %>%
+  pheatmap::pheatmap(cellwidth = 15, cellheight = 10, 
+           annotation_col = anno.col[, 4, drop = F] ,
+           annotation_colors = ann_colors,
+           scale = 'none',
+           show_colnames = F,
+           main = 'Heatmap using log2(CPM+1)',
+           width = 7, height = 15)
+
+exp %>%
+  pheatmap::pheatmap(cellwidth = 15, cellheight = 10, 
+           annotation_col = anno.col[, 4, drop = F] ,
+           annotation_colors = ann_colors,
+           scale = 'row',
+           show_colnames = F,
+           main = 'Heatmap using z-scaled log2(CPM+1)',
+           width = 7, height = 15)
+
+```
+
+### Boxplot using log2CPM
+
+```{r, fig.height=12, fig.width=20, dev=c('png', 'pdf')}
+# 1) Align groups to exp2 columns (samples)
+stopifnot(all(colnames(exp) %in% rownames(anno.col)))
+
+# 2) Long-format: one row per (transcript, sample)
+df_long <- as.data.frame(exp) %>%
+  rownames_to_column("transcript") %>%
+  pivot_longer(-transcript, names_to = "sample", values_to = "log2CPM") %>%
+  left_join(anno.col %>% rownames_to_column() %>% select(rowname, group), 
+            by = c('sample' = 'rowname')) %>%
+  mutate(transcript = factor(transcript, 
+                             levels = c("NM_152816.4", "NM_001025947.3", "NM_001276340.2",
+                                        "NM_001405252.1", "NM_001276341.2", "NM_001360007.2",
+                                        "NM_001360008.2","NM_001360009.2", "NM_001360010.2",
+                                        "NM_001405253.1","NM_001405254.1","NM_001405255.1",
+                                        "NM_001405256.1","NM_001405257.1","NM_001405258.1",
+                                        "NM_001405259.1","NM_001405260.1","NM_001405261.1",
+                                        "NM_001405262.1","NM_001405263.1","NM_001405264.1","NM_001405265.1",
+                                        "NR_075074.2","NR_175921.1",
+                                        "NR_175922.1","NR_175923.1","NR_175924.1","NR_175925.1","NR_175926.1",
+                                        "NR_175927.1","NR_175928.1","NR_175929.1","NR_175930.1","NR_175931.1",
+                                        "NR_175932.1","NR_175933.1", "XM_006522638.5")))
+
+# 3) Boxplots of expression by group, faceted by transcript (one facet per row of exp2)
+ggplot(df_long, aes(x = group, y = log2CPM, fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Transcript expression log2(CPM+1)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 9),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~ transcript, scales = "free_y", ncol = 8)  +
+    force_panelsizes(rows = unit(2, 'in'),
+                   cols = unit(2, 'in')) 
+
+ggplot(df_long, aes(x = transcript, y = log2CPM, fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Transcript expression log2(CPM+1)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        strip.text = element_text(size = 9)) +
+  facet_wrap(~ group, scales = "free_y")  +
+    force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+```
+
+
+Only show NM transcripts
+```{r, fig.height=12, fig.width=15, dev=c('png', 'pdf')}
+
+# 3) Boxplots of expression by group, faceted by transcript (one facet per row of exp2)
+ggplot(df_long %>%
+         filter(#transcript %in% c("NM_001025947.3", "NM_001405252.1", "NM_001360007.2", "NM_001405259.1")
+                str_detect(transcript, '^NM')), 
+       aes(x = group, y = log2CPM, fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Transcript expression log2(CPM+1)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 9),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~ transcript, scales = "free_y", ncol = 5)  +
+    force_panelsizes(rows = unit(2, 'in'),
+                   cols = unit(2, 'in')) 
+
+ggplot(df_long %>%
+         filter(#transcript %in% c("NM_001025947.3", "NM_001405252.1", "NM_001360007.2", "NM_001405259.1")
+                str_detect(transcript, '^NM')),
+       aes(x = transcript, y = log2CPM, fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Transcript expression log2(CPM+1)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        strip.text = element_text(size = 9)) +
+  facet_wrap(~ group, scales = "free_y", , ncol = 3)  +
+    force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+
+```
+
+### PCA using log2TPM
+This is only done because we need to caluclate TSI based on TPM, TPM can eliminate transcript length bias. Though in this data, the transcript length are quite similar, effects are minimal
+
+```{r, fig.height=15, fig.width=20, dev=c('png', 'pdf')}
+
+# Map samples to tissues (assumes colnames(exp2) are sample IDs)
+stopifnot(all(colnames(exp) %in% rownames(anno.col)))
+
+## get TPM first
+
+calculateTPM <- function(se = se) {
+  
+  counts <- assays(se)$counts %>% colSums()
+  incompcounts <- data.frame(metadata(se)$incompatibleCounts)[, colnames(se)] %>% colSums()
+  totalcounts <- counts + incompcounts
+  
+  tx_lengths <- rowRanges(se) %>% width() %>% sum
+  
+  stopifnot(rownames(counts) == names(tx_lengths))
+  
+  tpm <- assays(se)$counts/tx_lengths*1e3
+  sum <- colSums(tpm)
+  
+  tmp <- tpm/sum*1e6
+  return(tpm)
+
+}
+
+tpm <- calculateTPM(se1)
+colnames(tpm) <- colnames(exp)
+
+# PCA 
+autoplot(prcomp(log2(tpm+1) %>% t()), 
+         data = anno.col,
+         color = 'group', size = 4) +
+  scale_color_brewer(palette = "Set2") +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) +
+  ggtitle('PCA using log2(TPM+1) for chr16 transcripts')
+
+tpm <- tpm[rownames(exp), ]
+
+autoplot(prcomp(log2(tpm+1) %>% t()), 
+         data = anno.col,
+         color = 'group', size = 4) +
+  scale_color_brewer(palette = "Set2") +
+  force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) +
+  ggtitle('PCA using log2(TPM+1) of Dnm1l transcripts')
+
+```
+
+
+### Heatmap using log2TPM
+
+```{r, fig.height=15, fig.width=20, dev=c('png', 'pdf')}
+log2(tpm + 1) %>%
+  pheatmap::pheatmap(cellwidth = 15, cellheight = 10, 
+           annotation_col = anno.col[, 4, drop = F] ,
+           annotation_colors = ann_colors,
+           scale = 'none',
+           show_colnames = F,
+           main = 'Heatmap using log2(TPM+1)',
+           width = 7, height = 15)
+
+log2(tpm + 1) %>%
+  pheatmap::pheatmap(cellwidth = 15, cellheight = 10, 
+           annotation_col = anno.col[, 4, drop = F] ,
+           annotation_colors = ann_colors,
+           scale = 'row',
+           show_colnames = F,
+           main = 'Heatmap using z-scaled log2(TPM+1)',
+           width = 7, height = 15)
+```
+
+
+### Boxplot using log2TPM
+
+```{r, fig.height=15, fig.width=20, dev=c('png', 'pdf')}
+df_long2 <- as.data.frame(tpm) %>%
+  rownames_to_column("transcript") %>%
+  pivot_longer(-transcript, names_to = "sample", values_to = "TPM") %>%
+  left_join(anno.col %>% rownames_to_column() %>% select(rowname, group), 
+            by = c('sample' = 'rowname')) %>%
+  mutate(transcript = factor(transcript, 
+                             levels = c("NM_152816.4", "NM_001025947.3", "NM_001276340.2",
+                                        "NM_001405252.1", "NM_001276341.2", "NM_001360007.2",
+                                        "NM_001360008.2","NM_001360009.2", "NM_001360010.2",
+                                        "NM_001405253.1","NM_001405254.1","NM_001405255.1",
+                                        "NM_001405256.1","NM_001405257.1","NM_001405258.1",
+                                        "NM_001405259.1","NM_001405260.1","NM_001405261.1",
+                                        "NM_001405262.1","NM_001405263.1","NM_001405264.1","NM_001405265.1",
+                                        "NR_075074.2","NR_175921.1",
+                                        "NR_175922.1","NR_175923.1","NR_175924.1","NR_175925.1","NR_175926.1",
+                                        "NR_175927.1","NR_175928.1","NR_175929.1","NR_175930.1","NR_175931.1",
+                                        "NR_175932.1","NR_175933.1", "XM_006522638.5")))
+
+# 3) Boxplots of expression by group, faceted by transcript (one facet per row of exp2)
+ggplot(df_long2, aes(x = group, y = log2(TPM+1), fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Transcript expression log2(TPM+1)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 9),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~ transcript, scales = "free_y", ncol = 8)  +
+    force_panelsizes(rows = unit(2, 'in'),
+                   cols = unit(2, 'in')) 
+
+ggplot(df_long2, aes(x = transcript, y = log2(TPM+1), fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Transcript expression log2(TPM+1)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        strip.text = element_text(size = 9)) +
+  facet_wrap(~ group, scales = "free_y")  +
+    force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+
+# Only show NM transcripts
+ggplot(df_long2 %>%
+         filter(#transcript %in% c("NM_001025947.3", "NM_001405252.1", "NM_001360007.2", "NM_001405259.1")
+                str_detect(transcript, '^NM')), 
+       aes(x = group, y = log2(TPM+1), fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Transcript expression log2(TPM+1)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 9),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~ transcript, scales = "free_y", ncol = 5)  +
+    force_panelsizes(rows = unit(2, 'in'),
+                   cols = unit(2, 'in')) 
+
+ggplot(df_long2 %>%
+         filter(#transcript %in% c("NM_001025947.3", "NM_001405252.1", "NM_001360007.2", "NM_001405259.1")
+                str_detect(transcript, '^NM')),
+       aes(x = transcript, y = log2(TPM+1), fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Transcript expression log2(TPM+1)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        strip.text = element_text(size = 9)) +
+  facet_wrap(~ group, scales = "free_y", , ncol = 3)  +
+    force_panelsizes(rows = unit(3, 'in'),
+                   cols = unit(3, 'in')) 
+
+
+# Mean TPM per (transcript, tissue), fill missing tissues with 0 to keep range [1/n, 1]
+xi_tbl <- df_long2 %>%
+  group_by(transcript, group) %>%
+  summarise(xi = mean(TPM, na.rm = TRUE))
+
+# TSI = max(xi) / sum(xi)
+tsi_tbl <- xi_tbl %>%
+  group_by(transcript) %>%
+  summarise(
+    sum_x = sum(xi),
+    max_x = max(xi),
+    TSI   = ifelse(sum_x > 0, max_x / sum_x, NA_real_),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(TSI))
+
+print(tsi_tbl)
+
+
+```
+
+### Statistical test using log2CPM and log2TPM
+
+Average expression as log2(CPM+1), TPM of each cell type, and ANOVA p values (both logCPM and logTPM).  
+
+```{r, dev=c('png', 'pdf')}
+
+pvals <- sapply(1:nrow(exp), function(x){
+  
+  anova(lm(exp[x,]~group))$`Pr(>F)`[1]
+  
+}, simplify = T)
+
+qvals <- p.adjust(pvals, method = 'BH')
+
+pvals2 <- sapply(1:nrow(tpm), function(x){
+  
+  anova(lm(log2(tpm+1)[x,]~group))$`Pr(>F)`[1]
+  
+}, simplify = T)
+
+qvals2 <- p.adjust(pvals2, method = 'BH')
+
+# Initialize an empty matrix to store the results
+result <- matrix(NA, nrow = nrow(exp), ncol = length(levels(group)))
+colnames(result) <- levels(group)
+rownames(result) <- rownames(exp)
+
+# Calculate the mean value in each row for each group
+for (i in seq_along(levels(group))) {
+  group_samples <- which(group == levels(group)[i])
+  result[, i] <- rowMeans(exp[, group_samples], na.rm = TRUE)
+}
+
+# Convert the result to a data frame for better readability
+result <- as.data.frame(result)
+
+result <- data.frame(result, pvals_lcpm = pvals, FDR_lcpm = qvals, 
+                     pvals_ltpm = pvals2, FDR_ltpm = qvals2,  
+                     exp, tpm,
+                    check.names = FALSE) 
+
+colnames(result)[11:ncol(result)] <- paste(colnames(result)[11:ncol(result)], 
+                                 rep(c('log2CPM', 'TPM'), each = 12), 
+                                 sep = '_') 
+
+result <- left_join(result %>% rownames_to_column(var = 'transcript'),
+                    tsi_tbl, by = 'transcript')
+
+datatable(result[c(1:11, 36:38, 12:35)]) %>%
+  formatRound(columns=2:ncol(result), digits=3)
+
+write.csv(result, 'mouse_anova.csv')
+
+```
+
+
+### Statistical analysis using edgeR QL test
+```{r}
+library(edgeR)
+dge <- DGEList(counts = assays(se1)$counts, 
+               genes = rowData(se1) %>% data.frame(),
+               group = group, 
+               remove.zeros = T)
+
+y <- normLibSizes(dge)
+y$samples
+
+## edgeR manual section 3.2.6
+## ANOVA like test
+design <- model.matrix(~group, data = y$samples)
+colnames(design)[-1] <- levels(group)[-1]
+
+y <- estimateDisp(y, design, robust = T)
+y$common.dispersion
+plotBCV(y)
+
+fit <- glmQLFit(y, design, robust = T)
+qlf <- glmQLFTest(fit, coef = 2:ncol(design))
+
+deg <- topTags(qlf, n = Inf, p.value = Inf) %>% 
+  data.frame() %>%
+  filter(GENEID == 'Dnm1l') 
+
+# fold change here is relative to Brain
+deg %>% 
+  select(c(1:2, 12:ncol(deg))) %>% 
+  datatable() %>%
+  formatRound(columns=3:11, digits=3)
+
+write.csv(deg[, -11], 'mouse_edger_anovalike.csv') # remove eqClassById list column
+```
+
+
+```{r}
+
+sessionInfo()
+```
