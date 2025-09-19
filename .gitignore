@@ -1,0 +1,55 @@
+# Data files (typically too large for git)
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.sam
+*.vcf
+*.bcf
+*.cram
+*.h5
+*.hdf5
+
+# Analysis outputs
+*.log
+*.out
+*.err
+*.tmp
+*.temp
+
+# Software-specific files
+.snakemake/
+.snakemake_tmp/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# R files
+.Rhistory
+.RData
+.Ruserdata
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Large result files
+results/*.pdf
+results/*.png
+results/*.jpg
+results/*.svg
